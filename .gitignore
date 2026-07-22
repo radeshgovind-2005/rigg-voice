@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Whisper model (large, downloaded/copied separately)
+models/
+*.bin
