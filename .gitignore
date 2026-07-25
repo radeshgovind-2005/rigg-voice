@@ -26,3 +26,7 @@ dist-ssr
 # Whisper model (large, downloaded/copied separately)
 models/
 *.bin
+
+# agent + editor
+.claude/
+.DS_Store
