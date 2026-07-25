@@ -1,16 +1,211 @@
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
+use arboard::Clipboard;
+use tauri::{Emitter, Manager};
 
-// ---- Commands (called from the frontend) ----
+#[cfg(target_os = "macos")]
+mod fn_tap;
+#[cfg(target_os = "macos")]
+mod paste;
 
-// Transcribe an existing WAV file on disk.
+// ---- App state ----
+struct Recording {
+    flag: Arc<AtomicBool>,
+    buffer: Arc<Mutex<Vec<f32>>>,
+    sample_rate: Arc<AtomicU32>,
+    handle: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct AppState {
+    rec: Mutex<Option<Recording>>,
+    // Fast, small model for live streaming preview (base, ~142MB).
+    whisper_streaming: Mutex<Option<Arc<WhisperContext>>>,
+    // Quality model for the final transcription pass (medium, ~1.5GB).
+    whisper_final: Mutex<Option<Arc<WhisperContext>>>,
+    // The app that was frontmost when the bar was triggered — where we paste back.
+    target_pid: Mutex<Option<i32>>,
+}
+
+// ---- Commands ----
+
+// Start capturing from the mic. Two threads: one records audio, one keeps
+// re-transcribing the growing buffer and streams the live text to the UI via
+// the "partial" event — so words appear as you speak instead of the bar
+// freezing until the end. `stop_recording` then does one clean final pass.
 #[tauri::command]
-fn transcribe(path: String) -> Result<String, String> {
+fn start_recording(app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
+    let mut guard = state.rec.lock().unwrap();
+    if guard.is_some() {
+        return Err("already recording".into());
+    }
+
+    let ctx = get_streaming_context(state.inner())?; // fast base model for live preview
+
+    let flag = Arc::new(AtomicBool::new(true));
+    let buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
+    let sample_rate = Arc::new(AtomicU32::new(16000));
+
+    // 1) microphone capture
+    let (f1, b1, s1) = (flag.clone(), buffer.clone(), sample_rate.clone());
+    let handle = std::thread::spawn(move || recording_thread(f1, b1, s1));
+
+    // 2) live streaming transcription — sliding window for constant latency.
+    //    Instead of re-transcribing the entire recording every cycle, we only
+    //    send the last ~8 seconds to Whisper. Earlier text is "confirmed" and
+    //    kept as a prefix. This keeps each inference pass fast regardless of
+    //    how long the recording runs.
+    let (f2, b2, s2) = (flag.clone(), buffer.clone(), sample_rate.clone());
+    let ctx2 = ctx.clone();
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        let mut last_len = 0usize;
+        let mut confirmed = String::new(); // text from earlier windows
+        let window_secs: f32 = 8.0;        // sliding window size
+        let overlap_secs: f32 = 1.5;       // overlap to avoid cutting words
+
+        while f2.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(450));
+            if !f2.load(Ordering::Relaxed) {
+                break;
+            }
+            let (samples, sr) = {
+                let b = b2.lock().unwrap();
+                (b.clone(), s2.load(Ordering::Relaxed))
+            };
+            if samples.len() <= last_len {
+                continue; // nothing new captured since last pass
+            }
+            last_len = samples.len();
+
+            let window_samples = (window_secs * sr as f32) as usize;
+            let overlap_samples = (overlap_secs * sr as f32) as usize;
+
+            // If the buffer is longer than the window, confirm earlier text
+            // and only transcribe the tail.
+            let slice = if samples.len() > window_samples {
+                // The portion before (buffer - window + overlap) is "done".
+                // Transcribe it once to lock in the confirmed prefix.
+                let confirm_end = samples.len() - window_samples + overlap_samples;
+                if confirmed.is_empty() && confirm_end > 0 {
+                    let early = resample_to_16k(&samples[..confirm_end], sr);
+                    if let Ok(t) = run_whisper(&ctx2, &early) {
+                        confirmed = t;
+                    }
+                }
+                // Only send the last `window_samples` to Whisper.
+                &samples[samples.len() - window_samples..]
+            } else {
+                &samples[..]
+            };
+
+            let mono = resample_to_16k(slice, sr);
+            if mono.len() < 8000 {
+                continue; // under ~0.5s — too little to transcribe well yet
+            }
+            if let Ok(tail) = run_whisper(&ctx2, &mono) {
+                let full = if confirmed.is_empty() {
+                    tail
+                } else {
+                    format!("{} {}", confirmed.trim(), tail.trim())
+                };
+                let _ = app2.emit("partial", full);
+            }
+        }
+    });
+
+    *guard = Some(Recording { flag, buffer, sample_rate, handle });
+    Ok(())
+}
+
+// Stop recording, do one final (best-quality) transcription, copy to clipboard.
+//
+// This is an `async` command and the CPU-heavy Whisper pass runs inside
+// `spawn_blocking`, so it NEVER touches the UI/main thread — that's what was
+// causing the macOS spinning-wait cursor. We grab the audio + model handle
+// cheaply up front (no lock is held across an await), then offload the work.
+#[tauri::command]
+async fn stop_recording(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    // Cheap, synchronous hand-off: stop the mic, snapshot samples, clone the
+    // (Arc) model. All guards are dropped before we await anything.
+    let (samples, sr, ctx, use_final) = {
+        let recording = state.rec.lock().unwrap().take().ok_or("not recording")?;
+        recording.flag.store(false, Ordering::Relaxed);
+        let _ = recording.handle.join(); // mic thread exits within ~50ms
+        let samples = recording.buffer.lock().unwrap().clone();
+        let sr = recording.sample_rate.load(Ordering::Relaxed);
+        // Try the quality model; fall back to the streaming model if it's not
+        // ready yet (e.g. still downloading).
+        let (ctx, use_final) = match get_final_context(state.inner()) {
+            Ok(c) => (c, true),
+            Err(_) => (get_streaming_context(state.inner())?, false),
+        };
+        (samples, sr, ctx, use_final)
+    };
+
+    let handle = tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+        let mono = resample_to_16k(&samples, sr);
+        if mono.is_empty() {
+            return Err("no audio captured".into());
+        }
+        if use_final {
+            run_whisper_final(&ctx, &mono)
+        } else {
+            run_whisper(&ctx, &mono)
+        }
+    });
+    let text = match handle.await {
+        Ok(res) => res?,
+        Err(_) => return Err("transcription task failed".into()),
+    };
+
+    copy_to_clipboard(&text)?; // land the words on the clipboard
+    Ok(text)
+}
+
+// Reactivate the app that was focused when the bar opened and paste the
+// transcript (already on the clipboard) into it. This is the auto-paste half of
+// the "Both" behaviour; the Copy button covers the clipboard half.
+#[tauri::command]
+fn paste_last(state: tauri::State<AppState>) {
+    #[cfg(target_os = "macos")]
+    {
+        let pid = *state.target_pid.lock().unwrap();
+        if let Some(pid) = pid {
+            paste::paste_into(pid);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = state;
+    }
+}
+
+// Dismiss the floating bar (Esc from the UI).
+#[tauri::command]
+fn hide_bar(window: tauri::Window) {
+    let _ = window.hide();
+}
+
+// Abort the current recording and throw the audio away — no transcription, no
+// clipboard, no paste. Backs both the Cancel and Restart controls.
+#[tauri::command]
+fn cancel_recording(state: tauri::State<AppState>) {
+    if let Some(recording) = state.rec.lock().unwrap().take() {
+        recording.flag.store(false, Ordering::Relaxed);
+        let _ = recording.handle.join();
+    }
+}
+
+// Transcribe an existing WAV file (kept for testing / future use).
+#[tauri::command]
+fn transcribe(path: String, state: tauri::State<AppState>) -> Result<String, String> {
     let mut reader = hound::WavReader::open(&path).map_err(|e| e.to_string())?;
     let spec = reader.spec();
 
-    // Read every sample as f32, whatever the source format.
     let raw: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Float => reader
             .samples::<f32>()
@@ -25,7 +220,6 @@ fn transcribe(path: String) -> Result<String, String> {
         }
     };
 
-    // Downmix to mono, then resample to the 16kHz Whisper wants.
     let channels = spec.channels as usize;
     let mono: Vec<f32> = if channels > 1 {
         raw.chunks(channels)
@@ -36,36 +230,54 @@ fn transcribe(path: String) -> Result<String, String> {
     };
     let mono = resample_to_16k(&mono, spec.sample_rate);
 
-    transcribe_samples(mono)
-}
-
-// Record `seconds` from the mic, then transcribe.
-#[tauri::command]
-fn record_and_transcribe(seconds: u32) -> Result<String, String> {
-    let samples = record_samples(seconds)?;
-    transcribe_samples(samples)
+    let ctx = get_final_context(state.inner())?;
+    let text = run_whisper_final(&ctx, &mono)?;
+    copy_to_clipboard(&text)?;
+    Ok(text)
 }
 
 // ---- Shared helpers ----
 
-// The one place the Whisper model actually runs. Expects 16kHz mono f32.
-fn transcribe_samples(samples: Vec<f32>) -> Result<String, String> {
-    let model_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../models/ggml-large-v3-turbo.bin");
-    let model_path = model_path.to_str().ok_or("invalid model path")?;
+// Fast model (base, ~142MB) — loaded once, used for live streaming preview.
+fn get_streaming_context(state: &AppState) -> Result<Arc<WhisperContext>, String> {
+    let mut guard = state.whisper_streaming.lock().unwrap();
+    if guard.is_none() {
+        let model_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../models/ggml-base.bin");
+        let model_path = model_path.to_str().ok_or("invalid model path")?;
+        let ctx = WhisperContext::new_with_params(model_path, WhisperContextParameters::default())
+            .map_err(|e| e.to_string())?;
+        *guard = Some(Arc::new(ctx));
+    }
+    Ok(guard.as_ref().unwrap().clone())
+}
 
-    let ctx = WhisperContext::new_with_params(model_path, WhisperContextParameters::default())
-        .map_err(|e| e.to_string())?;
+// Quality model (medium, ~1.5GB) — loaded once, used for the final transcription.
+fn get_final_context(state: &AppState) -> Result<Arc<WhisperContext>, String> {
+    let mut guard = state.whisper_final.lock().unwrap();
+    if guard.is_none() {
+        let model_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../models/ggml-medium.bin");
+        let model_path = model_path.to_str().ok_or("invalid model path")?;
+        let ctx = WhisperContext::new_with_params(model_path, WhisperContextParameters::default())
+            .map_err(|e| e.to_string())?;
+        *guard = Some(Arc::new(ctx));
+    }
+    Ok(guard.as_ref().unwrap().clone())
+}
+
+// Run the streaming model — fast, rough preview. Transcription only.
+fn run_whisper(ctx: &WhisperContext, samples: &[f32]) -> Result<String, String> {
     let mut state = ctx.create_state().map_err(|e| e.to_string())?;
 
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_language(Some("pt"));   // you speak Portuguese
-    params.set_translate(true);        // ...output in English
+    params.set_language(Some("auto"));
+    params.set_translate(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
 
-    state.full(params, &samples).map_err(|e| e.to_string())?;
+    state.full(params, samples).map_err(|e| e.to_string())?;
 
     let mut text = String::new();
     for segment in state.as_iter() {
@@ -74,19 +286,49 @@ fn transcribe_samples(samples: Vec<f32>) -> Result<String, String> {
     Ok(text.trim().to_string())
 }
 
-// Records `seconds` from the default input device and returns 16kHz mono f32.
-fn record_samples(seconds: u32) -> Result<Vec<f32>, String> {
-    let host = cpal::default_host();
-    let device = host.default_input_device().ok_or("no input device")?;
-    let config = device.default_input_config().map_err(|e| e.to_string())?;
-    let sample_rate = config.sample_rate();
-    let channels = config.channels() as usize;
+// Run the final model — high quality, auto-detected language.
+fn run_whisper_final(ctx: &WhisperContext, samples: &[f32]) -> Result<String, String> {
+    let mut state = ctx.create_state().map_err(|e| e.to_string())?;
 
-    let buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_language(Some("auto"));
+    params.set_translate(false); // set to true to enable translation to English
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+
+    state.full(params, samples).map_err(|e| e.to_string())?;
+
+    let mut text = String::new();
+    for segment in state.as_iter() {
+        text.push_str(&segment.to_str_lossy().map_err(|e| e.to_string())?);
+    }
+    Ok(text.trim().to_string())
+}
+
+// Fatia 4: put text on the system clipboard so it can be pasted anywhere with Cmd+V.
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
+    clipboard.set_text(text.to_string()).map_err(|e| e.to_string())
+}
+
+// Owns the cpal input stream for one recording. Pushes mono f32 into `buffer`
+// until `flag` is cleared, then drops the stream (which stops capture).
+fn recording_thread(flag: Arc<AtomicBool>, buffer: Arc<Mutex<Vec<f32>>>, sample_rate_out: Arc<AtomicU32>) {
+    let host = cpal::default_host();
+    let device = match host.default_input_device() {
+        Some(d) => d,
+        None => { eprintln!("no input device"); return; }
+    };
+    let config = match device.default_input_config() {
+        Ok(c) => c,
+        Err(e) => { eprintln!("input config error: {e}"); return; }
+    };
+    sample_rate_out.store(config.sample_rate(), Ordering::Relaxed);
+    let channels = config.channels() as usize;
     let buf = buffer.clone();
     let err_fn = |e| eprintln!("audio stream error: {e}");
 
-    // Mic usually gives f32 on macOS; handle i16 too just in case.
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => device.build_input_stream(
             config.into(),
@@ -111,16 +353,22 @@ fn record_samples(seconds: u32) -> Result<Vec<f32>, String> {
             err_fn,
             None,
         ),
-        _ => return Err("unsupported sample format".into()),
+        _ => { eprintln!("unsupported sample format"); return; }
+    };
+
+    let stream = match stream {
+        Ok(s) => s,
+        Err(e) => { eprintln!("build stream error: {e}"); return; }
+    };
+    if let Err(e) = stream.play() {
+        eprintln!("stream play error: {e}");
+        return;
     }
-    .map_err(|e| e.to_string())?;
 
-    stream.play().map_err(|e| e.to_string())?;
-    std::thread::sleep(std::time::Duration::from_secs(seconds as u64));
-    drop(stream); // stops recording
-
-    let mono = buffer.lock().unwrap().clone();
-    Ok(resample_to_16k(&mono, sample_rate))
+    while flag.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // `stream` is dropped here, which stops the capture.
 }
 
 // The mic runs at 44.1/48kHz; Whisper needs 16kHz. Simple linear resample.
@@ -142,13 +390,155 @@ fn resample_to_16k(input: &[f32], from_rate: u32) -> Vec<f32> {
     out
 }
 
+// ---- Trigger + window placement ----
+
+// Park the bar near the bottom-center of the screen it's on.
+fn position_bottom_center<R: tauri::Runtime>(win: &tauri::WebviewWindow<R>) {
+    let monitor = win
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| win.primary_monitor().ok().flatten());
+    if let Some(monitor) = monitor {
+        let screen = monitor.size();
+        if let Ok(winsize) = win.outer_size() {
+            let x = ((screen.width as i32) - (winsize.width as i32)) / 2;
+            let margin = (monitor.scale_factor() * 96.0) as i32; // ~96pt above the Dock
+            let y = (screen.height as i32) - (winsize.height as i32) - margin;
+            let _ = win.set_position(tauri::PhysicalPosition::new(x.max(0), y.max(0)));
+        }
+    }
+}
+
+// Fired by the Fn double-tap or the Ctrl+Shift+R fallback. Remembers the app
+// the user was in, then shows the bar and lets the UI toggle record/stop.
+fn fire_trigger<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(pid) = paste::frontmost_pid() {
+            let me = std::process::id() as i32;
+            if pid != me {
+                if let Some(state) = app.try_state::<AppState>() {
+                    *state.target_pid.lock().unwrap() = Some(pid);
+                }
+            }
+        }
+    }
+
+    let app2 = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(win) = app2.get_webview_window("main") {
+            position_bottom_center(&win);
+            let _ = win.show();
+            // Focus so Esc / keyboard reach the bar. We paste back to the stored
+            // target PID regardless, so stealing focus here is harmless.
+            let _ = win.set_focus();
+        }
+    });
+
+    // Emit the toggle a beat AFTER showing, so the webview's "trigger" listener
+    // is definitely registered — otherwise the very first event can be lost and
+    // the bar shows but never starts recording.
+    let app3 = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(90));
+        let _ = app3.emit("trigger", ());
+    });
+}
+
 // ---- App entry ----
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(AppState::default())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![transcribe, record_and_transcribe])
+        .setup(|app| {
+            // No-Dock background-agent behaviour comes from LSUIElement in
+            // Info.plist. We deliberately do NOT call set_activation_policy() at
+            // runtime — it's known to break window.show() (tauri#5122), which is
+            // exactly the call our trigger depends on.
+
+            if let Some(win) = app.get_webview_window("main") {
+                // Native blurred glass. HudWindow is the most see-through
+                // material — it shows the desktop *blurred* through dark glass
+                // (light materials like Popover just frost to flat grey). Being
+                // dark glass, it pairs with light text (see styles.css).
+                #[cfg(target_os = "macos")]
+                {
+                    use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial, NSVisualEffectState};
+                    let _ = apply_vibrancy(
+                        &win,
+                        NSVisualEffectMaterial::HudWindow,
+                        Some(NSVisualEffectState::Active),
+                        Some(20.0),
+                    );
+                }
+
+                position_bottom_center(&win);
+            }
+
+            #[cfg(desktop)]
+            {
+                use tauri_plugin_global_shortcut::{
+                    Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState,
+                };
+
+                // Reliable fallback trigger: Ctrl+Shift+R.
+                let mods = Modifiers::CONTROL | Modifiers::SHIFT;
+                let key = Code::KeyR;
+
+                app.handle().plugin(
+                    tauri_plugin_global_shortcut::Builder::new()
+                        .with_handler(move |app, shortcut, event| {
+                            if event.state() == ShortcutState::Pressed
+                                && shortcut.matches(mods, key)
+                            {
+                                fire_trigger(app);
+                            }
+                        })
+                        .build(),
+                )?;
+
+                app.global_shortcut()
+                    .register(Shortcut::new(Some(mods), key))?;
+            }
+
+            // Primary trigger: Fn/Globe double-tap (needs Input Monitoring).
+            #[cfg(target_os = "macos")]
+            {
+                let handle = app.handle().clone();
+                fn_tap::spawn(move || fire_trigger(&handle));
+            }
+
+            // Warm both Whisper models at launch so the first recording is snappy.
+            // Streaming model (base, ~142MB) loads fast; final model (medium,
+            // ~1.5GB) loads in parallel.
+            {
+                let h1 = app.handle().clone();
+                std::thread::spawn(move || {
+                    if let Some(state) = h1.try_state::<AppState>() {
+                        let _ = get_streaming_context(state.inner());
+                    }
+                });
+                let h2 = app.handle().clone();
+                std::thread::spawn(move || {
+                    if let Some(state) = h2.try_state::<AppState>() {
+                        let _ = get_final_context(state.inner());
+                    }
+                });
+            }
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            start_recording,
+            stop_recording,
+            transcribe,
+            paste_last,
+            hide_bar,
+            cancel_recording
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
