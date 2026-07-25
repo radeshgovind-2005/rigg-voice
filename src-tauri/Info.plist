@@ -4,5 +4,10 @@
 <dict>
     <key>NSMicrophoneUsageDescription</key>
     <string>Rigg Voice uses the microphone to transcribe your speech.</string>
+    <key>NSInputMonitoringUsageDescription</key>
+    <string>Rigg Voice watches for the Fn/Globe double-tap that opens the dictation bar.</string>
+    <!-- Background agent: no Dock icon, never steals focus from the app you're typing in. -->
+    <key>LSUIElement</key>
+    <true/>
 </dict>
 </plist>
