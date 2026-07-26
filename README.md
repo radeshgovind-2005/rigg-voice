@@ -99,7 +99,21 @@ Until Input Monitoring is granted, the event tap can't be created and the app fa
 
 ## Install
 
+### Homebrew (recommended)
+
+```bash
+brew tap radeshgovind-2005/rigg-voice
+brew trust radeshgovind-2005/rigg-voice
+brew install --cask rigg-voice
+```
+
+The `brew trust` step is required once — Homebrew asks you to explicitly trust any third-party tap before installing from it.
+
+### Manual
+
 Download the latest `.dmg` from the [Releases](../../releases) page and drag Rigg Voice to Applications.
+
+### First launch
 
 Because the app isn't code-signed yet, macOS Gatekeeper will warn you the first time. Open it once with **right-click → Open** (or System Settings → Privacy & Security → "Open Anyway"). After that it launches normally. The Whisper models download automatically on first run.
 
