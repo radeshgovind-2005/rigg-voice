@@ -1,0 +1,55 @@
+name: release
+
+# Build a universal macOS .dmg and publish it to a GitHub Release whenever a
+# version tag (v*) is pushed. Unsigned for now — downloaders open the app the
+# first time with right-click → Open to get past Gatekeeper.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build, package, and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: --target universal-apple-darwin
+          tagName: ${{ github.ref_name }}
+          releaseName: "Rigg Voice ${{ github.ref_name }}"
+          releaseBody: |
+            On-device voice-to-text for macOS.
+
+            **Install:** download the `.dmg` below and drag Rigg Voice to Applications.
+            **First launch:** right-click the app → Open (unsigned build, so this is a one-time step to get past Gatekeeper).
+
+            The Whisper models download automatically on first run.
+          releaseDraft: false
+          prerelease: false
