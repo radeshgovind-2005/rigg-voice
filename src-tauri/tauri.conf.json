@@ -28,6 +28,18 @@
         "shadow": true,
         "skipTaskbar": true,
         "acceptFirstMouse": true
+      },
+      {
+        "label": "preferences",
+        "title": "Rigg Voice",
+        "width": 420,
+        "height": 340,
+        "resizable": false,
+        "decorations": true,
+        "transparent": false,
+        "center": true,
+        "visible": false,
+        "skipTaskbar": false
       }
     ],
     "security": {

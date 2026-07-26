@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
 use arboard::Clipboard;
@@ -43,7 +45,7 @@ fn start_recording(app: tauri::AppHandle, state: tauri::State<AppState>) -> Resu
         return Err("already recording".into());
     }
 
-    let ctx = get_streaming_context(state.inner())?; // fast base model for live preview
+    let ctx = get_streaming_context(&app, state.inner())?; // fast base model for live preview
 
     let flag = Arc::new(AtomicBool::new(true));
     let buffer = Arc::new(Mutex::new(Vec::<f32>::new()));
@@ -128,7 +130,10 @@ fn start_recording(app: tauri::AppHandle, state: tauri::State<AppState>) -> Resu
 // causing the macOS spinning-wait cursor. We grab the audio + model handle
 // cheaply up front (no lock is held across an await), then offload the work.
 #[tauri::command]
-async fn stop_recording(state: tauri::State<'_, AppState>) -> Result<String, String> {
+async fn stop_recording(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
     // Cheap, synchronous hand-off: stop the mic, snapshot samples, clone the
     // (Arc) model. All guards are dropped before we await anything.
     let (samples, sr, ctx, use_final) = {
@@ -139,9 +144,9 @@ async fn stop_recording(state: tauri::State<'_, AppState>) -> Result<String, Str
         let sr = recording.sample_rate.load(Ordering::Relaxed);
         // Try the quality model; fall back to the streaming model if it's not
         // ready yet (e.g. still downloading).
-        let (ctx, use_final) = match get_final_context(state.inner()) {
+        let (ctx, use_final) = match get_final_context(&app, state.inner()) {
             Ok(c) => (c, true),
-            Err(_) => (get_streaming_context(state.inner())?, false),
+            Err(_) => (get_streaming_context(&app, state.inner())?, false),
         };
         (samples, sr, ctx, use_final)
     };
@@ -202,7 +207,11 @@ fn cancel_recording(state: tauri::State<AppState>) {
 
 // Transcribe an existing WAV file (kept for testing / future use).
 #[tauri::command]
-fn transcribe(path: String, state: tauri::State<AppState>) -> Result<String, String> {
+fn transcribe(
+    app: tauri::AppHandle,
+    path: String,
+    state: tauri::State<AppState>,
+) -> Result<String, String> {
     let mut reader = hound::WavReader::open(&path).map_err(|e| e.to_string())?;
     let spec = reader.spec();
 
@@ -230,22 +239,139 @@ fn transcribe(path: String, state: tauri::State<AppState>) -> Result<String, Str
     };
     let mono = resample_to_16k(&mono, spec.sample_rate);
 
-    let ctx = get_final_context(state.inner())?;
+    let ctx = get_final_context(&app, state.inner())?;
     let text = run_whisper_final(&ctx, &mono)?;
     copy_to_clipboard(&text)?;
     Ok(text)
 }
 
+// ---- Model management ----
+//
+// Models are resolved in two ways:
+//  * In development (`tauri dev`, a debug build) we use the repo's `models/`
+//    directory if it's there, so local iteration never re-downloads anything.
+//  * In a packaged, shipped `.app` there is no such directory, so we download
+//    the model on first run into the OS app-data dir and cache it there.
+struct ModelSpec {
+    filename: &'static str,
+    url: &'static str,
+}
+
+// Fast model (base, ~142MB) — live streaming preview.
+const STREAMING_MODEL: ModelSpec = ModelSpec {
+    filename: "ggml-base.bin",
+    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
+};
+// Quality model (medium, ~1.5GB) — final transcription pass.
+const FINAL_MODEL: ModelSpec = ModelSpec {
+    filename: "ggml-medium.bin",
+    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin",
+};
+
+// Where a given model file should live on disk.
+fn model_path(app: &tauri::AppHandle, filename: &str) -> Result<PathBuf, String> {
+    // Dev builds: prefer the checked-out models/ dir for fast iteration.
+    if cfg!(debug_assertions) {
+        let dev = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../models")
+            .join(filename);
+        if dev.exists() {
+            return Ok(dev);
+        }
+    }
+    // Shipped app: cache under the OS app-data directory.
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("models");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join(filename))
+}
+
+// Ensure the model exists locally, downloading it on first run if needed.
+fn ensure_model(app: &tauri::AppHandle, spec: &ModelSpec) -> Result<PathBuf, String> {
+    let path = model_path(app, spec.filename)?;
+    if !path.exists() {
+        download_model(app, spec, &path)?;
+    }
+    Ok(path)
+}
+
+// Stream the model to disk, emitting "model-download" progress events the UI can
+// show. Writes to a `.part` file first, then renames — so an interrupted
+// download never leaves a half-file that looks complete.
+fn download_model(app: &tauri::AppHandle, spec: &ModelSpec, dest: &Path) -> Result<(), String> {
+    let resp = ureq::get(spec.url)
+        .call()
+        .map_err(|e| format!("download failed: {e}"))?;
+    let total: u64 = resp
+        .header("Content-Length")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let tmp = dest.with_extension("part");
+    let mut file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+    let mut reader = resp.into_reader();
+    let mut buf = [0u8; 65536];
+    let mut downloaded: u64 = 0;
+    let mut last_emit = std::time::Instant::now();
+
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        downloaded += n as u64;
+        if last_emit.elapsed().as_millis() >= 200 {
+            let percent = if total > 0 {
+                (downloaded as f64 / total as f64 * 100.0) as u32
+            } else {
+                0
+            };
+            let _ = app.emit(
+                "model-download",
+                serde_json::json!({
+                    "model": spec.filename,
+                    "downloaded": downloaded,
+                    "total": total,
+                    "percent": percent,
+                    "done": false
+                }),
+            );
+            last_emit = std::time::Instant::now();
+        }
+    }
+    file.flush().map_err(|e| e.to_string())?;
+    drop(file);
+    std::fs::rename(&tmp, dest).map_err(|e| e.to_string())?;
+
+    let _ = app.emit(
+        "model-download",
+        serde_json::json!({
+            "model": spec.filename,
+            "downloaded": downloaded,
+            "total": total,
+            "percent": 100u32,
+            "done": true
+        }),
+    );
+    Ok(())
+}
+
 // ---- Shared helpers ----
 
 // Fast model (base, ~142MB) — loaded once, used for live streaming preview.
-fn get_streaming_context(state: &AppState) -> Result<Arc<WhisperContext>, String> {
+fn get_streaming_context(
+    app: &tauri::AppHandle,
+    state: &AppState,
+) -> Result<Arc<WhisperContext>, String> {
     let mut guard = state.whisper_streaming.lock().unwrap();
     if guard.is_none() {
-        let model_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../models/ggml-base.bin");
-        let model_path = model_path.to_str().ok_or("invalid model path")?;
-        let ctx = WhisperContext::new_with_params(model_path, WhisperContextParameters::default())
+        let path = ensure_model(app, &STREAMING_MODEL)?;
+        let path = path.to_str().ok_or("invalid model path")?;
+        let ctx = WhisperContext::new_with_params(path, WhisperContextParameters::default())
             .map_err(|e| e.to_string())?;
         *guard = Some(Arc::new(ctx));
     }
@@ -253,13 +379,15 @@ fn get_streaming_context(state: &AppState) -> Result<Arc<WhisperContext>, String
 }
 
 // Quality model (medium, ~1.5GB) — loaded once, used for the final transcription.
-fn get_final_context(state: &AppState) -> Result<Arc<WhisperContext>, String> {
+fn get_final_context(
+    app: &tauri::AppHandle,
+    state: &AppState,
+) -> Result<Arc<WhisperContext>, String> {
     let mut guard = state.whisper_final.lock().unwrap();
     if guard.is_none() {
-        let model_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../models/ggml-medium.bin");
-        let model_path = model_path.to_str().ok_or("invalid model path")?;
-        let ctx = WhisperContext::new_with_params(model_path, WhisperContextParameters::default())
+        let path = ensure_model(app, &FINAL_MODEL)?;
+        let path = path.to_str().ok_or("invalid model path")?;
+        let ctx = WhisperContext::new_with_params(path, WhisperContextParameters::default())
             .map_err(|e| e.to_string())?;
         *guard = Some(Arc::new(ctx));
     }
@@ -446,6 +574,24 @@ fn fire_trigger<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     });
 }
 
+// Show the Preferences window (declared hidden in tauri.conf.json). Opened from
+// the tray "Preferences…" item.
+fn show_preferences<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(win) = app.get_webview_window("preferences") {
+        let _ = win.center();
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+}
+
+// Quit the whole agent, called from the Preferences window's button. Carries a
+// Some(code), so the ExitRequested guard in run() lets it through (window-close
+// exits carry None and are blocked).
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 // ---- App entry ----
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -454,10 +600,62 @@ pub fn run() {
         .manage(AppState::default())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            // No-Dock background-agent behaviour comes from LSUIElement in
-            // Info.plist. We deliberately do NOT call set_activation_policy() at
-            // runtime — it's known to break window.show() (tauri#5122), which is
-            // exactly the call our trigger depends on.
+            // Menu-bar-only agent. LSUIElement in Info.plist hides the Dock
+            // icon in the packaged .app, but NOT under `tauri dev`, so we also
+            // set the activation policy to Accessory at runtime. This drops the
+            // Dock icon and the app menu bar in both dev and release, leaving
+            // only the tray icon. (The old tauri#5122 window.show() bug that
+            // discouraged this is fixed in current Tauri; if the floating bar
+            // ever stops appearing on trigger, revisit here.)
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            // Menu-bar (tray) icon — the app's only visible home. Because the
+            // Dock icon is hidden (LSUIElement), without this there is no way to
+            // quit the agent short of Activity Monitor, and nowhere to hang
+            // future settings. Menu: Start dictation + Quit.
+            {
+                use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+                use tauri::tray::TrayIconBuilder;
+
+                let start_i =
+                    MenuItem::with_id(app, "start", "Start dictation", true, None::<&str>)?;
+                let prefs_i =
+                    MenuItem::with_id(app, "prefs", "Preferences…", true, None::<&str>)?;
+                let quit_i =
+                    MenuItem::with_id(app, "quit", "Quit Rigg Voice", true, Some("Cmd+Q"))?;
+                let sep = PredefinedMenuItem::separator(app)?;
+                let menu = Menu::with_items(app, &[&start_i, &prefs_i, &sep, &quit_i])?;
+
+                let mut tray = TrayIconBuilder::new()
+                    .tooltip("Rigg Voice")
+                    .menu(&menu)
+                    .show_menu_on_left_click(true)
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "start" => fire_trigger(app),
+                        "prefs" => show_preferences(app),
+                        "quit" => app.exit(0),
+                        _ => {}
+                    });
+                // Use the app icon if one is embedded; don't panic (unwrap) if
+                // it isn't — an iconless tray is better than a crash.
+                if let Some(icon) = app.default_window_icon().cloned() {
+                    tray = tray.icon(icon);
+                }
+                let _tray = tray.build(app)?;
+            }
+
+            // WARP-style: closing the Preferences window hides it instead of
+            // quitting the agent. The app keeps running in the menu bar.
+            if let Some(prefs) = app.get_webview_window("preferences") {
+                let prefs_hide = prefs.clone();
+                prefs.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = prefs_hide.hide();
+                    }
+                });
+            }
 
             if let Some(win) = app.get_webview_window("main") {
                 // Native blurred glass. HudWindow is the most see-through
@@ -518,13 +716,13 @@ pub fn run() {
                 let h1 = app.handle().clone();
                 std::thread::spawn(move || {
                     if let Some(state) = h1.try_state::<AppState>() {
-                        let _ = get_streaming_context(state.inner());
+                        let _ = get_streaming_context(&h1, state.inner());
                     }
                 });
                 let h2 = app.handle().clone();
                 std::thread::spawn(move || {
                     if let Some(state) = h2.try_state::<AppState>() {
-                        let _ = get_final_context(state.inner());
+                        let _ = get_final_context(&h2, state.inner());
                     }
                 });
             }
@@ -537,8 +735,19 @@ pub fn run() {
             transcribe,
             paste_last,
             hide_bar,
-            cancel_recording
+            cancel_recording,
+            quit_app
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // Keep the agent alive when all windows are closed/hidden. An
+            // explicit Quit (app.exit) carries Some(code) and is allowed
+            // through; only window-close-driven exits (code: None) are blocked.
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+                if code.is_none() {
+                    api.prevent_exit();
+                }
+            }
+        });
 }

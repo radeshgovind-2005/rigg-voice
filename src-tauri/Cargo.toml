@@ -18,7 +18,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["macos-private-api"] }
+tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-global-shortcut = "2"
 serde = { version = "1", features = ["derive"] }
@@ -27,6 +27,7 @@ whisper-rs = { version = "0.16.0", features = ["metal"] }
 hound = "3.5.1"
 cpal = "0.18.1"
 arboard = "3"
+ureq = "2"
 
 # The Fn double-tap tap and auto-paste are implemented as raw CoreFoundation /
 # CoreGraphics FFI (see src/fn_tap.rs, src/paste.rs). window-vibrancy gives the
